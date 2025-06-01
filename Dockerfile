@@ -13,7 +13,7 @@ COPY . .
 # Build the application
 # CGO_ENABLED=0 for a statically linked binary, useful for minimal Docker images
 # -ldflags "-s -w" to strip debug information and reduce binary size
-RUN CGO_ENABLED=0 GOOS=linux go build -a -ldflags "-s -w" -o plex-aggregator main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -a -ldflags "-s -w" -o MulTau main.go
 
 # Stage 2: Create the final lightweight image
 FROM alpine:latest
@@ -27,11 +27,11 @@ WORKDIR /app
 COPY config.json .
 
 # Copy the built binary from the builder stage
-COPY --from=builder /app/plex-aggregator .
+COPY --from=builder /app/MulTau .
 
 # Expose the port the application listens on (default 32400)
 # This should match the aggregator_listen_address in config.json
 EXPOSE 32400
 
 # Set the entrypoint for the container
-ENTRYPOINT ["./plex-aggregator"]
+ENTRYPOINT ["./MulTau"]
