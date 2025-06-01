@@ -1,0 +1,15 @@
+{
+  "aggregator_listen_address": "0.0.0.0:32400",
+  "source_plex_servers": [
+    {
+      "name": "PlexServer1",
+      "url": "https://your-plex-server1-url.com",
+      "token": "YOUR_PLEX_TOKEN_FOR_SERVER1"
+    },
+    {
+      "name": "PlexServer2",
+      "url": "http://plex-server2-ip:32400",
+      "token": "YOUR_PLEX_TOKEN_FOR_SERVER2"
+    }
+  ]
+}
