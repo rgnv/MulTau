@@ -1,0 +1,88 @@
+name: Release MulTau
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to create a release and upload assets
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21' # Matches your Dockerfile, adjust if needed
+
+      - name: Get release version
+        id: get_version
+        run: echo "RELEASE_VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+      - name: Build and package for platforms
+        run: |
+          platforms=("linux/amd64" "linux/arm64" "darwin/amd64" "darwin/arm64" "windows/amd64" "windows/arm64")
+          for platform in "${platforms[@]}"
+          do
+            GOOS=${platform%/*}
+            GOARCH=${platform#*/}
+            BINARY_NAME="MulTau"
+            if [ "$GOOS" = "windows" ]; then
+              BINARY_NAME="MulTau.exe"
+            fi
+
+            echo "Building for $GOOS/$GOARCH..."
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags "-s -w" -o "$BINARY_NAME" main.go
+
+            ARCHIVE_DIR_NAME="MulTau_${RELEASE_VERSION}_${GOOS}_${GOARCH}"
+            mkdir "$ARCHIVE_DIR_NAME"
+            mv "$BINARY_NAME" "$ARCHIVE_DIR_NAME/"
+            cp README.md "$ARCHIVE_DIR_NAME/"
+            cp config.example.json "$ARCHIVE_DIR_NAME/"
+
+            if [ "$GOOS" = "windows" ]; then
+              ARCHIVE_NAME="${ARCHIVE_DIR_NAME}.zip"
+              zip -r "$ARCHIVE_NAME" "$ARCHIVE_DIR_NAME"
+              echo "Created $ARCHIVE_NAME"
+            else
+              ARCHIVE_NAME="${ARCHIVE_DIR_NAME}.tar.gz"
+              tar -czvf "$ARCHIVE_NAME" "$ARCHIVE_DIR_NAME"
+              echo "Created $ARCHIVE_NAME"
+            fi
+            rm -rf "$ARCHIVE_DIR_NAME" # Clean up directory after archiving
+          done
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.RELEASE_VERSION }}
+          release_name: MulTau ${{ env.RELEASE_VERSION }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Release Assets (tar.gz)
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./MulTau_*.tar.gz
+          asset_content_type: application/gzip
+
+      - name: Upload Release Assets (zip)
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./MulTau_*.zip
+          asset_content_type: application/zip

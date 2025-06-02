@@ -1,0 +1,18 @@
+{
+  "aggregator_listen_address": "0.0.0.0:32400",
+  "source_plex_servers": [
+    {
+      "name": "Plex Server 1 (Example)",
+      "url": "http://localhost:32400",
+      "plex_token": "YOUR_PLEX_TOKEN_FOR_SERVER1_HERE"
+    },
+    {
+      "name": "Plex Server 2 (Optional Example)",
+      "url": "http://another-plex-server.local:32400",
+      "plex_token": "YOUR_PLEX_TOKEN_FOR_SERVER2_HERE"
+    }
+  ],
+  "aggregator_plex_token": "YOUR_OPTIONAL_SECRET_TOKEN_FOR_AGGREGATOR_ACCESS",
+  "sync_interval_minutes": 30,
+  "log_level": "info"
+}
