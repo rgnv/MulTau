@@ -210,6 +210,10 @@ The application logs to standard output. You can redirect this to a file for per
     -   Check aggregator logs for errors fetching data from source servers.
 -   **Incorrect History/Sessions:** Ensure `sync_interval_minutes` is set appropriately if you expect frequent updates to history.
 
+## Author
+
+This project is maintained by rgnv ([rgnv@proton.me](mailto:rgnv@proton.me)).
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

@@ -1,3 +1,9 @@
+// Copyright (c) 2025 rgnv <rgnv@proton.me>
+// MulTau - A Plex Aggregator
+//
+// This program acts as a reverse proxy to aggregate multiple Plex Media Servers
+// into a unified view, primarily for Tautulli monitoring.
+
 package main
 
 import (
