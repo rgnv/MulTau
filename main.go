@@ -7,14 +7,16 @@
 package main
 
 import (
-	"encoding/xml"
-	"sort"
-	"strings"
+	// Standard library imports
 	"bytes"
-	"context"
-	"crypto/tls"
 	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -22,10 +24,13 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	// Third-party imports
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 )
@@ -39,9 +44,11 @@ type PlexInstanceConfig struct {
 type Config struct {
 	SourcePlexServers       []PlexInstanceConfig `json:"source_plex_servers"`
 	AggregatorListenAddress string               `json:"aggregator_listen_address"`
+	ListenAddress           string               `json:"-"` // Computed from AggregatorListenAddress
 	SyncIntervalMinutes     int                  `json:"sync_interval_minutes"` // Retained for potential periodic history fetching from source Plex servers
 	LogLevel                string               `json:"log_level,omitempty"`
 	AggregatorPlexToken     string               `json:"aggregator_plex_token,omitempty"` // Token clients must use to connect to this aggregator
+	MachineIdentifier       string               `json:"machine_identifier,omitempty"`
 }
 
 // PlexHistoryItem defines the structure for individual history entries from Plex.
@@ -237,6 +244,49 @@ var (
 	mergedHistoryMutex sync.RWMutex
 ) // Restored wsServer declaration
 
+// HTTP client pools for better performance
+var (
+	// Default HTTP client with TLS verification
+	defaultHTTPClient = &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+
+	// HTTP client with insecure TLS (for self-signed certificates)
+	insecureHTTPClient = &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+
+	// Proxy HTTP client with longer timeout and no compression
+	proxyHTTPClient = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			DisableCompression:  true,
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+)
+
+// Buffer pool for response body reading
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
 // WebSocketIdentity structures for the initial message to the client
 type WebSocketIdentityServerInfo struct {
 	FriendlyName      string `json:"friendlyName"`
@@ -295,73 +345,115 @@ func checkAuth(r *http.Request, isWebSocket bool) bool {
 	return true
 }
 
+type WebSocketClient struct {
+	conn   *websocket.Conn
+	send   chan []byte
+	remote string
+}
+
 type WebSocketServer struct {
-	clients    map[*websocket.Conn]bool
+	clients    map[*WebSocketClient]bool
 	broadcast  chan []byte
-	register   chan *websocket.Conn
-	unregister chan *websocket.Conn
+	register   chan *WebSocketClient
+	unregister chan *WebSocketClient
 	mu         sync.Mutex
 }
 
-func NewWebSocketServer() *WebSocketServer {
-	return &WebSocketServer{
-		clients:    make(map[*websocket.Conn]bool),
-		broadcast:  make(chan []byte),
-		register:   make(chan *websocket.Conn),
-		unregister: make(chan *websocket.Conn),
+func startWebSocketServer(ctx context.Context, wg *sync.WaitGroup) *WebSocketServer {
+	defer wg.Done()
+	
+	server := &WebSocketServer{
+		broadcast:  make(chan []byte, 256), // Buffered channel for better performance
+		register:   make(chan *WebSocketClient),
+		unregister: make(chan *WebSocketClient),
+		clients:    make(map[*WebSocketClient]bool),
 	}
+
+	go server.run(ctx)
+	return server
 }
 
-func (s *WebSocketServer) run() {
+func (server *WebSocketServer) run(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	
 	for {
 		select {
-		case client := <-s.register:
-			s.mu.Lock()
-			s.clients[client] = true
-			s.mu.Unlock()
-		case client := <-s.unregister:
-			s.mu.Lock()
-			if _, ok := s.clients[client]; ok {
-				delete(s.clients, client)
-				client.Close()
+		case <-ctx.Done():
+			// Graceful shutdown: close all client connections
+			for client := range server.clients {
+				close(client.send)
+				delete(server.clients, client)
 			}
-			s.mu.Unlock()
-		case message := <-s.broadcast:
-			s.mu.Lock()
-			for client := range s.clients {
-				if err := client.WriteMessage(websocket.TextMessage, message); err != nil {
-					log.Printf("error: %v", err)
-					client.Close()
-					delete(s.clients, client)
+			return
+			
+		case client := <-server.register:
+			server.clients[client] = true
+			log.Printf("WebSocket client registered. Total clients: %d", len(server.clients))
+
+		case client := <-server.unregister:
+			if _, ok := server.clients[client]; ok {
+				delete(server.clients, client)
+				close(client.send)
+				log.Printf("WebSocket client unregistered. Total clients: %d", len(server.clients))
+			}
+
+		case message := <-server.broadcast:
+			// Send to all clients with non-blocking writes
+			for client := range server.clients {
+				select {
+				case client.send <- message:
+				default:
+					// Client's send channel is full, close it
+					log.Printf("WebSocket client send buffer full, closing connection")
+					delete(server.clients, client)
+					close(client.send)
 				}
 			}
-			s.mu.Unlock()
+			
+		case <-ticker.C:
+			// Periodic cleanup and stats
+			log.Printf("WebSocket server stats: %d connected clients, broadcast queue: %d/%d", 
+				len(server.clients), len(server.broadcast), cap(server.broadcast))
 		}
 	}
 }
 
-func loadConfig() (*Config, error) {
-	configFile, err := os.Open("config.json")
+func loadConfig(configPath string) *Config {
+	file, err := os.Open(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+		log.Fatalf("Failed to open config file: %v", err)
 	}
-	defer configFile.Close()
+	defer file.Close()
 
-	var config Config
-	err = json.NewDecoder(configFile).Decode(&config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	decoder := json.NewDecoder(file)
+	var cfg Config
+	if err := decoder.Decode(&cfg); err != nil {
+		log.Fatalf("Failed to decode config: %v", err)
 	}
-	log.Printf("[loadConfig] Loaded AggregatorListenAddress: '%s'", config.AggregatorListenAddress) // Debug log
-	return &config, nil
+
+	// Generate Machine Identifier from config or use provided one
+	if cfg.MachineIdentifier == "" {
+		cfg.MachineIdentifier = generateMachineIdentifier(cfg)
+	}
+
+	// Set ListenAddress from AggregatorListenAddress for backward compatibility
+	cfg.ListenAddress = cfg.AggregatorListenAddress
+
+	return &cfg
+}
+
+func generateMachineIdentifier(cfg Config) string {
+	hash := sha256.Sum256([]byte(cfg.MachineIdentifier))
+	return hex.EncodeToString(hash[:])
 }
 
 func main() {
-	var err error
-	config, err = loadConfig()
-	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
-	}
+	var wg sync.WaitGroup
+	configPath := flag.String("config", "config.json", "Path to configuration file")
+	flag.Parse()
+
+	config = loadConfig(*configPath)
 	
 	// Validate configuration
 	if len(config.SourcePlexServers) == 0 {
@@ -382,45 +474,90 @@ func main() {
 		log.Printf("[main]   - %s: %s", serverName, server.URL)
 	}
 
-	wsServer = NewWebSocketServer()
+	// Create a root context that can be cancelled
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start WebSocket server
+	wg.Add(1)
+	wsServer = startWebSocketServer(ctx, &wg)
 
 	router := mux.NewRouter()
 	apiRouter := router.PathPrefix("/").Subrouter()
+	apiRouter.Use(authMiddleware) // Apply auth middleware
 
 	apiRouter.HandleFunc("/", handlePlexRoot)
 	apiRouter.HandleFunc("/status/sessions", handlePlexStatusSessions)
 	apiRouter.HandleFunc("/ws", handleWebSocket)                         // For clients like Tautulli to connect for aggregated notifications (custom path)
 	apiRouter.HandleFunc("/:/websockets/notifications", handleWebSocket) // Standard Plex path, handled by our aggregator
 	apiRouter.HandleFunc("/status/sessions/history/all", handlePlexHistoryAll)
+	apiRouter.HandleFunc("/identity", handleIdentity)
 	apiRouter.HandleFunc("/{path:.*}", handlePlexAPIProxy)
 
-	go wsServer.run()
-
-	var wg sync.WaitGroup
+	// Start WebSocket watchers
 	for _, instance := range config.SourcePlexServers {
 		wg.Add(1)
-		go watchPlexInstance(context.Background(), &wg, instance, wsServer)
+		go watchPlexInstance(ctx, &wg, instance, wsServer)
 	}
 
-	go syncHistory()
+	// Start history sync if configured
+	if config.SyncIntervalMinutes > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			syncHistory()
+		}()
+	}
 
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+	// Setup graceful shutdown
+	server := &http.Server{
+		Addr:         config.ListenAddress,
+		Handler:      router,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Handle shutdown signals
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
 	go func() {
-		<-shutdown
-		log.Println("Shutting down...")
-		wg.Wait()
-		os.Exit(0)
+		log.Printf("[main] Server started and listening on %s", config.ListenAddress)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
 	}()
 
-	log.Printf("Starting Plex Aggregator on %s", config.AggregatorListenAddress)
-	if err := http.ListenAndServe(config.AggregatorListenAddress, router); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
-	}
-}
+	// Wait for shutdown signal
+	<-sigChan
+	log.Println("[main] Shutdown signal received, gracefully shutting down...")
 
-func generateMachineIdentifier() string {
-	return "PlexAggregator"
+	// Create shutdown context with timeout
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	// Shutdown HTTP server
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[main] Error shutting down server: %v", err)
+	}
+
+	// Cancel main context to stop all goroutines
+	cancel()
+
+	// Wait for all goroutines to finish
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("[main] All goroutines stopped, shutdown complete")
+	case <-shutdownCtx.Done():
+		log.Println("[main] Shutdown timeout exceeded")
+	}
 }
 
 func handlePlexRoot(w http.ResponseWriter, r *http.Request) {
@@ -434,7 +571,7 @@ func handlePlexRoot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/xml;charset=utf-8")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	machineID := generateMachineIdentifier()
+	machineID := generateMachineIdentifier(*config)
 
 	// Return a proper Plex server identity response in XML format
 	xmlResponse := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
@@ -456,62 +593,81 @@ func handlePlexStatusSessions(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/xml;charset=utf-8")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	
-	// Aggregate active sessions from source Plex servers
-	var allSessions []PlexSessionItem
-	
-	httpTransport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	httpClient := &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: httpTransport,
+	// Aggregate active sessions from source Plex servers concurrently
+	type sessionResult struct {
+		sessions []PlexSessionItem
+		server   string
+		err      error
 	}
 	
+	resultChan := make(chan sessionResult, len(config.SourcePlexServers))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	// Launch concurrent goroutines to fetch sessions
 	for _, instance := range config.SourcePlexServers {
-		sessionsURL := fmt.Sprintf("%s/status/sessions", instance.URL)
-		req, err := http.NewRequest("GET", sessionsURL, nil)
-		if err != nil {
-			log.Printf("Error creating request for sessions from %s: %v", instance.Name, err)
-			continue
-		}
-		
-		req.Header.Set("X-Plex-Token", instance.PlexToken)
-		req.Header.Set("Accept", "application/xml")
-		
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			log.Printf("Error fetching sessions from %s: %v", instance.Name, err)
-			continue
-		}
-		defer resp.Body.Close()
-		
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("Non-OK status from %s sessions endpoint: %d", instance.Name, resp.StatusCode)
-			continue
-		}
-		
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("Error reading sessions response from %s: %v", instance.Name, err)
-			continue
-		}
-		
-		var sessionsContainer PlexSessionsMediaContainer
-		if err := xml.Unmarshal(body, &sessionsContainer); err != nil {
-			log.Printf("Error unmarshalling sessions XML from %s: %v", instance.Name, err)
-			// Log a sample of the body for debugging
-			var bodySample string
-			if len(body) > 500 {
-				bodySample = string(body[:500])
-			} else {
-				bodySample = string(body)
+		go func(inst PlexInstanceConfig) {
+			result := sessionResult{server: inst.Name}
+			
+			sessionsURL := fmt.Sprintf("%s/status/sessions", inst.URL)
+			req, err := http.NewRequestWithContext(ctx, "GET", sessionsURL, nil)
+			if err != nil {
+				result.err = fmt.Errorf("error creating request: %w", err)
+				resultChan <- result
+				return
 			}
-			log.Printf("Sessions response body sample from %s: %s", instance.Name, bodySample)
+			
+			req.Header.Set("X-Plex-Token", inst.PlexToken)
+			req.Header.Set("Accept", "application/xml")
+			
+			resp, err := insecureHTTPClient.Do(req)
+			if err != nil {
+				result.err = fmt.Errorf("error fetching sessions: %w", err)
+				resultChan <- result
+				return
+			}
+			defer resp.Body.Close()
+			
+			if resp.StatusCode != http.StatusOK {
+				result.err = fmt.Errorf("non-OK status: %d", resp.StatusCode)
+				resultChan <- result
+				return
+			}
+			
+			// Use buffer pool for better memory management
+			buf := bufferPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			defer bufferPool.Put(buf)
+			
+			_, err = io.Copy(buf, resp.Body)
+			if err != nil {
+				result.err = fmt.Errorf("error reading response: %w", err)
+				resultChan <- result
+				return
+			}
+			
+			var sessionsContainer PlexSessionsMediaContainer
+			if err := xml.Unmarshal(buf.Bytes(), &sessionsContainer); err != nil {
+				result.err = fmt.Errorf("error unmarshalling XML: %w", err)
+				resultChan <- result
+				return
+			}
+			
+			result.sessions = sessionsContainer.Items
+			resultChan <- result
+		}(instance)
+	}
+	
+	// Collect results
+	var allSessions []PlexSessionItem
+	for i := 0; i < len(config.SourcePlexServers); i++ {
+		result := <-resultChan
+		if result.err != nil {
+			log.Printf("Error fetching sessions from %s: %v", result.server, result.err)
 			continue
 		}
-		
-		log.Printf("Fetched %d active sessions from %s", sessionsContainer.Size, instance.Name)
-		allSessions = append(allSessions, sessionsContainer.Items...)
+		log.Printf("Fetched %d active sessions from %s", len(result.sessions), result.server)
+		allSessions = append(allSessions, result.sessions...)
 	}
 	
 	// Create the aggregated response
@@ -540,39 +696,88 @@ func handlePlexStatusSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePlexHistoryAll(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Received request for /status/sessions/history/all from %s", r.RemoteAddr)
+	log.Printf("Received request to history endpoint: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
 	if !checkAuth(r, false) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-
+	
+	// Read from cached merged history
 	mergedHistoryMutex.RLock()
-	defer mergedHistoryMutex.RUnlock()
-
-	// Create a container to hold the history items for XML marshalling
-	// Tautulli expects certain attributes in the MediaContainer for history.
-	historyContainer := PlexHistoryMediaContainer{
-		Size:             len(mergedHistory),
-		AllowSync:        true, // Typical value seen in Plex responses
-		Identifier:       "com.plexapp.plugins.library", // Standard identifier
-		MediaTagPrefix:   "/system/bundle/media/flags/", // Common prefix
-		MediaTagVersion:  time.Now().Unix(), // Needs to be a timestamp like value
-		Videos:           make([]PlexHistoryItem, len(mergedHistory)),
+	historySnapshot := make([]PlexHistoryItem, len(mergedHistory))
+	copy(historySnapshot, mergedHistory)
+	mergedHistoryMutex.RUnlock()
+	
+	// Build response container
+	responseContainer := PlexHistoryMediaContainer{
+		Size:   len(historySnapshot),
+		Videos: historySnapshot,
 	}
-	copy(historyContainer.Videos, mergedHistory) // Copy to avoid issues if mergedHistory is modified elsewhere
-
-	w.Header().Set("Content-Type", "application/xml;charset=utf-8")
-	xmlBytes, err := xml.MarshalIndent(historyContainer, "", "  ")
-	if err != nil {
-		log.Printf("Error marshalling history to XML: %v", err)
-		http.Error(w, "Failed to generate history response", http.StatusInternalServerError)
-		return
+	
+	// Check Accept header to determine response format
+	acceptHeader := r.Header.Get("Accept")
+	
+	if strings.Contains(acceptHeader, "application/json") {
+		// Return JSON response
+		w.Header().Set("Content-Type", "application/json;charset=utf-8")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		
+		// Convert to JSON format
+		jsonContainer := JSONPlexMediaContainer{
+			MediaContainer: struct {
+				Size     int                   `json:"size"`
+				Metadata []JSONPlexHistoryItem `json:"Metadata"`
+			}{
+				Size:     len(historySnapshot),
+				Metadata: make([]JSONPlexHistoryItem, 0, len(historySnapshot)),
+			},
+		}
+		
+		for _, item := range historySnapshot {
+			jsonItem := JSONPlexHistoryItem{
+				Key:                   item.Key,
+				RatingKey:             item.RatingKey,
+				ParentRatingKey:       item.ParentRatingKey,
+				GrandparentRatingKey:  item.GrandparentRatingKey,
+				Title:                 item.Title,
+				GrandparentTitle:      item.GrandparentTitle,
+				ParentTitle:           item.ParentTitle,
+				Type:                  item.Type,
+				Thumb:                 item.Thumb,
+				Art:                   item.Art,
+				ParentThumb:           item.ParentThumb,
+				GrandparentThumb:      item.GrandparentThumb,
+				OriginallyAvailableAt: item.OriginallyAvailableAt,
+				ViewedAt:              item.ViewedAt,
+				AccountID:             item.AccountID,
+				DeviceID:              item.DeviceID,
+			}
+			jsonContainer.MediaContainer.Metadata = append(jsonContainer.MediaContainer.Metadata, jsonItem)
+		}
+		
+		if err := json.NewEncoder(w).Encode(jsonContainer); err != nil {
+			log.Printf("Error encoding history to JSON: %v", err)
+			http.Error(w, "Failed to generate history response", http.StatusInternalServerError)
+		}
+	} else {
+		// Default to XML response
+		w.Header().Set("Content-Type", "text/xml;charset=utf-8")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		
+		xmlBytes, err := xml.MarshalIndent(responseContainer, "", "  ")
+		if err != nil {
+			log.Printf("Error marshalling history to XML: %v", err)
+			http.Error(w, "Failed to generate history response", http.StatusInternalServerError)
+			return
+		}
+		
+		xmlResponse := `<?xml version="1.0" encoding="UTF-8"?>` + "\n" + string(xmlBytes)
+		if _, err := w.Write([]byte(xmlResponse)); err != nil {
+			log.Printf("Error writing history XML response: %v", err)
+		}
 	}
-
-	_, err = w.Write(xmlBytes)
-	if err != nil {
-		log.Printf("Error writing history XML response: %v", err)
-	}
+	
+	log.Printf("Returned %d history items to client", len(historySnapshot))
 }
 
 func handlePlexAPIProxy(w http.ResponseWriter, r *http.Request) {
@@ -597,15 +802,6 @@ func handlePlexAPIProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	transport := &http.Transport{
-		TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
-		DisableCompression: true,
-	}
-	client := &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: transport,
-	}
-
 	// Try each source server until we get a successful response
 	var lastError error
 	var lastStatusCode int
@@ -621,128 +817,95 @@ func handlePlexAPIProxy(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		// Copy headers from original request
 		for k, v := range r.Header {
 			req.Header[k] = v
 		}
 		req.Header.Set("X-Plex-Token", server.PlexToken)
 		req.Header.Set("Accept-Encoding", "identity") // Explicitly request no compression from server
 
-		resp, err := client.Do(req)
+		resp, err := proxyHTTPClient.Do(req)
 		if err != nil {
 			log.Printf("Error proxying request to %s: %v", server.Name, err)
 			lastError = err
 			continue
 		}
+		defer resp.Body.Close()
 		
 		// If we get a 404, try the next server
 		if resp.StatusCode == http.StatusNotFound {
-			resp.Body.Close()
 			log.Printf("Got 404 from %s for /%s, trying next server", server.Name, fullPath)
 			lastStatusCode = http.StatusNotFound
 			continue
 		}
 
 		// For any other response (success or error), use this response
-		defer resp.Body.Close()
-		
-		log.Printf("Upstream response from %s for /%s: Status: [%s], StatusCode: [%d], Proto: [%s], ContentLength: [%d], Uncompressed: [%t]", 
-			server.Name, fullPath, resp.Status, resp.StatusCode, resp.Proto, resp.ContentLength, resp.Uncompressed)
-		log.Printf("Upstream response headers for /%s:", fullPath)
-		for name, values := range resp.Header {
-			for _, value := range values {
-				log.Printf("  HEADER %s: %s", name, value)
-			}
-		}
-		log.Printf("Finished logging upstream headers for /%s. Now reading body.", fullPath)
+		log.Printf("Upstream response from %s for /%s: Status: %d", server.Name, fullPath, resp.StatusCode)
 
-		// Read the full body once - REMOVED the flawed TeeReader approach
-		processedBodyBytes, err := io.ReadAll(resp.Body)
+		// Use buffer pool for response body
+		buf := bufferPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer bufferPool.Put(buf)
+		
+		_, err = io.Copy(buf, resp.Body)
 		if err != nil {
-			log.Printf("Error reading full upstream response body: %v", err)
+			log.Printf("Error reading upstream response: %v", err)
 			http.Error(w, "Error reading upstream response", http.StatusInternalServerError)
 			return
 		}
 
+		bodyBytes := buf.Bytes()
+		
+		// Handle gzip decompression if needed
 		upstreamContentEncoding := resp.Header.Get("Content-Encoding")
-		log.Printf("Read %d bytes from upstream for /%s (Content-Type: %s, Original Content-Encoding: %s)", len(processedBodyBytes), fullPath, resp.Header.Get("Content-Type"), upstreamContentEncoding)
-
-		// Manually decompress if upstream sent gzip (DisableCompression on transport means client didn't ask for/handle it)
-		if upstreamContentEncoding == "gzip" && len(processedBodyBytes) > 0 {
-			gr, gzipErr := gzip.NewReader(bytes.NewReader(processedBodyBytes))
-			if gzipErr != nil {
-				log.Printf("Error creating gzip reader for /%s: %v. Sending empty body to client.", fullPath, gzipErr)
-				processedBodyBytes = []byte{} // Clear body on error
+		if upstreamContentEncoding == "gzip" && len(bodyBytes) > 0 {
+			gr, err := gzip.NewReader(bytes.NewReader(bodyBytes))
+			if err != nil {
+				log.Printf("Error creating gzip reader: %v", err)
 			} else {
-				decompressedBytes, readErr := io.ReadAll(gr)
-				gr.Close() // Close reader regardless of readErr
-				if readErr != nil {
-					log.Printf("Error decompressing gzipped body for /%s: %v. Sending empty body to client.", fullPath, readErr)
-					processedBodyBytes = []byte{} // Clear body on error
-				} else {
-					log.Printf("Manually decompressed gzipped body from upstream for /%s. Original size: %d, Decompressed size: %d", fullPath, len(processedBodyBytes), len(decompressedBytes))
-					processedBodyBytes = decompressedBytes // Replace with decompressed data
+				decompressed := bufferPool.Get().(*bytes.Buffer)
+				decompressed.Reset()
+				defer bufferPool.Put(decompressed)
+				
+				_, err = io.Copy(decompressed, gr)
+				gr.Close()
+				if err == nil {
+					bodyBytes = decompressed.Bytes()
 				}
 			}
 		}
 
-		// Log a snippet of the (potentially decompressed) body
-		logSnippet := string(processedBodyBytes)
-		if len(logSnippet) > 512 { // Truncate for logging
-			logSnippet = logSnippet[:512] + "... (truncated)"
-		}
-		log.Printf("Proxying (potentially decompressed) upstream response body snippet for /%s:\n%s", fullPath, logSnippet)
-
-		// Set headers and status code
-		// We will not forward Content-Encoding or Content-Length from upstream,
-		// as we are sending plain content and net/http will set the correct length.
+		// Copy response headers (except Content-Encoding and Content-Length)
 		for k, v := range resp.Header {
-			if strings.EqualFold(k, "Content-Encoding") || strings.EqualFold(k, "Content-Length") {
-				continue // Skip these headers, we send uncompressed and net/http sets length
+			if k != "Content-Encoding" && k != "Content-Length" {
+				w.Header()[k] = v
 			}
-			w.Header()[k] = v
 		}
+
+		// Set Content-Length based on actual body size
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(bodyBytes)))
+		
+		// Write status code
 		w.WriteHeader(resp.StatusCode)
 
-		// Special handling for /library/sections if upstream gives empty body for XML (after potential decompression)
-		if (path == "library/sections" || strings.HasPrefix(path, "library/sections?")) &&
-			resp.StatusCode == http.StatusOK &&
-			len(processedBodyBytes) == 0 && // Check length of processed (potentially decompressed) body
-			strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "xml") {
-
-			log.Printf("Warning: Upstream server %s returned 200 OK with an empty XML body for /%s. Sending default empty MediaContainer.", server.Name, fullPath)
-			// Send a minimal valid XML response
-			defaultXML := `<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="0"></MediaContainer>`
-			processedBodyBytes = []byte(defaultXML)
-			// Update Content-Type to ensure it's set correctly
-			w.Header().Set("Content-Type", "text/xml;charset=utf-8")
-		}
-
-		// Write the (potentially decompressed) body
-		if len(processedBodyBytes) > 0 {
-			written, writeErr := w.Write(processedBodyBytes)
-			if writeErr != nil {
-				log.Printf("Error writing response body for /%s: %v", fullPath, writeErr)
-			} else {
-				log.Printf("Successfully wrote %d bytes to client for /%s", written, fullPath)
-			}
-		} else {
-			log.Printf("No body to write for /%s (0 bytes after processing)", fullPath)
+		// Write response body
+		_, err = w.Write(bodyBytes)
+		if err != nil {
+			log.Printf("Error writing response: %v", err)
 		}
 		
-		// Successfully handled the request with this server
+		log.Printf("Successfully proxied %d bytes from %s for /%s", len(bodyBytes), server.Name, fullPath)
 		return
 	}
-	
-	// If we get here, all servers failed or returned 404
+
+	// If all servers failed
 	if lastStatusCode == http.StatusNotFound {
-		log.Printf("All servers returned 404 for /%s", fullPath)
-		http.Error(w, "Not Found", http.StatusNotFound)
+		http.Error(w, "Not found on any server", http.StatusNotFound)
 	} else if lastError != nil {
-		log.Printf("All servers failed for /%s. Last error: %v", fullPath, lastError)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		log.Printf("All servers failed, last error: %v", lastError)
+		http.Error(w, "Failed to proxy request", http.StatusBadGateway)
 	} else {
-		log.Printf("Unexpected state: no servers processed request for /%s", fullPath)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		http.Error(w, "Unknown error", http.StatusInternalServerError)
 	}
 }
 
@@ -761,9 +924,16 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wsServer.register <- conn
+	client := &WebSocketClient{
+		conn:   conn,
+		send:   make(chan []byte, 256),
+		remote: r.RemoteAddr,
+	}
+
+	wsServer.register <- client
 	defer func() {
-		wsServer.unregister <- conn
+		wsServer.unregister <- client
+		close(client.send)
 		conn.Close()
 	}()
 
@@ -773,12 +943,22 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			Type:   "identity",
 			Server: WebSocketIdentityServerInfo{
 				FriendlyName:      "Plex Aggregator",
-				MachineIdentifier: generateMachineIdentifier(),
+				MachineIdentifier: generateMachineIdentifier(*config),
 			},
 		},
 	}
 	identityBytes, _ := json.Marshal(identity)
 	wsServer.broadcast <- identityBytes
+
+	go func() {
+		for message := range client.send {
+			err := conn.WriteMessage(websocket.TextMessage, message)
+			if err != nil {
+				log.Printf("Error writing message to WebSocket client %s: %v", client.remote, err)
+				return
+			}
+		}
+	}()
 
 	for {
 		_, _, err := conn.ReadMessage()
@@ -797,10 +977,35 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	wsServer.broadcast <- disconnectBytes
 }
 
+func handleIdentity(w http.ResponseWriter, r *http.Request) {
+	identity := struct {
+		MachineIdentifier string `json:"machineIdentifier"`
+		Version           string `json:"version"`
+		Platform          string `json:"platform"`
+		PlatformVersion   string `json:"platformVersion"`
+		Device            string `json:"device"`
+		Model             string `json:"model"`
+		Product           string `json:"product"`
+		Vendor            string `json:"vendor"`
+	}{
+		MachineIdentifier: config.MachineIdentifier,
+		Version:           "1.0.0",
+		Platform:          "MulTau",
+		PlatformVersion:   "1.0.0",
+		Device:            "MulTau Aggregator",
+		Model:             "Aggregator",
+		Product:           "MulTau",
+		Vendor:            "MulTau",
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(identity)
+}
+
 func watchPlexInstance(ctx context.Context, wg *sync.WaitGroup, instanceConfig PlexInstanceConfig, wsServer *WebSocketServer) {
 	defer wg.Done()
 
-	// Construct WebSocket URL, ensuring correct scheme (ws/wss)
+	// Construct WebSocket URL with proper scheme
 	baseURL := instanceConfig.URL
 	wsSchemeURL := baseURL
 	if strings.HasPrefix(baseURL, "http://") {
@@ -808,72 +1013,119 @@ func watchPlexInstance(ctx context.Context, wg *sync.WaitGroup, instanceConfig P
 	} else if strings.HasPrefix(baseURL, "https://") {
 		wsSchemeURL = "wss://" + strings.TrimPrefix(baseURL, "https://")
 	} else if !strings.HasPrefix(baseURL, "ws://") && !strings.HasPrefix(baseURL, "wss://") {
-		// If no scheme, assume ws for now or consider it an error / require explicit ws/wss in config
-		// For now, let's log a warning if no http/https/ws/wss prefix found and try to prepend ws://
-		log.Printf("Warning: Plex instance URL '%s' for %s has no scheme, attempting ws://", baseURL, instanceConfig.Name)
+		log.Printf("Warning: Plex instance URL '%s' for %s has no scheme, using ws://", baseURL, instanceConfig.Name)
 		wsSchemeURL = "ws://" + baseURL
 	}
 
-	// Path: /:/websockets/notifications. Token in query ONLY. No custom dial headers (mimicking python-plexapi).
 	wsURL := fmt.Sprintf("%s/:/websockets/notifications?X-Plex-Token=%s", wsSchemeURL, instanceConfig.PlexToken)
 	u, err := url.Parse(wsURL)
 	if err != nil {
-		log.Printf("Error parsing WebSocket URL %s for %s: %v", wsURL, instanceConfig.Name, err)
+		log.Printf("Error parsing WebSocket URL for %s: %v", instanceConfig.Name, err)
 		return
 	}
-	log.Printf("Prepared WebSocket URL for %s: %s", instanceConfig.Name, u.String())
 
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 15 * time.Second, // Explicit handshake timeout
+		HandshakeTimeout: 15 * time.Second,
 	}
 	if u.Scheme == "wss" {
 		dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 
+	// Exponential backoff parameters
+	minBackoff := 1 * time.Second
+	maxBackoff := 5 * time.Minute
+	backoff := minBackoff
+	consecutiveFailures := 0
+
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("Stopping WebSocket watcher for %s", instanceConfig.Name)
 			return
 		default:
-			log.Printf("Attempting WebSocket connection to %s at %s", instanceConfig.Name, u.String())
-			log.Printf("[%s] Dialing WebSocket...", instanceConfig.Name)
-			conn, resp, err := dialer.Dial(u.String(), nil)
-			log.Printf("[%s] Dial completed. Error: %v", instanceConfig.Name, err)
+			log.Printf("Attempting WebSocket connection to %s", instanceConfig.Name)
+			
+			conn, resp, err := dialer.DialContext(ctx, u.String(), nil)
 			if err != nil {
-				log.Printf("Failed to connect to %s WebSocket: %v. Retrying in %v...", instanceConfig.Name, err, 5*time.Second)
-				time.Sleep(5 * time.Second) // Exponential backoff
+				consecutiveFailures++
+				log.Printf("Failed to connect to %s WebSocket (attempt %d): %v", instanceConfig.Name, consecutiveFailures, err)
+				
+				// Exponential backoff
+				time.Sleep(backoff)
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
 				continue
 			}
-			if resp != nil {
-				log.Printf("[%s] HTTP response status: %s", instanceConfig.Name, resp.Status)
-				b, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096)) // Limit read to avoid large output
-				if readErr != nil {
-					log.Printf("[%s] Error reading response body: %v", instanceConfig.Name, readErr)
-				} else {
-					log.Printf("[%s] HTTP response body: %s", instanceConfig.Name, string(b))
-				}
+			
+			// Connection successful, reset backoff
+			backoff = minBackoff
+			consecutiveFailures = 0
+			
+			if resp != nil && resp.StatusCode != http.StatusSwitchingProtocols {
+				log.Printf("Unexpected HTTP response from %s: %s", instanceConfig.Name, resp.Status)
 				resp.Body.Close()
 			}
-
+			
+			log.Printf("Successfully connected to %s WebSocket", instanceConfig.Name)
+			
+			// Handle WebSocket messages
+			conn.SetReadDeadline(time.Time{}) // No read deadline
+			conn.SetPongHandler(func(string) error {
+				conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+				return nil
+			})
+			
+			// Start ping ticker
+			ticker := time.NewTicker(30 * time.Second)
+			go func() {
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
+							log.Printf("Error sending ping to %s: %v", instanceConfig.Name, err)
+							conn.Close()
+							return
+						}
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+			
+			// Read messages
 			for {
 				_, message, err := conn.ReadMessage()
 				if err != nil {
 					log.Printf("Error reading message from %s: %v", instanceConfig.Name, err)
 					conn.Close()
+					ticker.Stop()
 					break
 				}
 
+				// Parse and forward message
 				event := PlexEvent{}
 				if err := json.Unmarshal(message, &event); err == nil {
 					event.SourceServer = instanceConfig.Name
 					modifiedMessage, _ := json.Marshal(event)
-					wsServer.broadcast <- modifiedMessage
+					
+					select {
+					case wsServer.broadcast <- modifiedMessage:
+					case <-ctx.Done():
+						conn.Close()
+						return
+					default:
+						log.Printf("Warning: broadcast channel full, dropping message from %s", instanceConfig.Name)
+					}
 				} else {
-					log.Printf("Failed to parse message from %s: %v", instanceConfig.Name, err)
+					log.Printf("Failed to parse WebSocket message from %s: %v", instanceConfig.Name, err)
 				}
 			}
-
-			time.Sleep(5 * time.Second)
+			
+			// Connection closed, wait before reconnecting
+			time.Sleep(backoff)
 		}
 	}
 }
@@ -881,135 +1133,160 @@ func watchPlexInstance(ctx context.Context, wg *sync.WaitGroup, instanceConfig P
 func syncHistory() {
 	for {
 		log.Println("Starting history sync cycle...")
-		var currentCycleHistory []PlexHistoryItem
-
-		httpTransport := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // Skip TLS verification for IPs/self-signed certs
+		
+		// Use context for proper cancellation
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		
+		type historyResult struct {
+			items  []PlexHistoryItem
+			server string
+			err    error
 		}
-		httpClient := &http.Client{
-			Timeout:   10 * time.Second,
-			Transport: httpTransport,
-		}
-
+		
+		resultChan := make(chan historyResult, len(config.SourcePlexServers))
+		
+		// Fetch history from all servers concurrently
 		for _, instance := range config.SourcePlexServers {
-			historyURL := fmt.Sprintf("%s/status/sessions/history/all", instance.URL)
-			req, err := http.NewRequest("GET", historyURL, nil)
-			if err != nil {
-				log.Printf("Error creating request for %s history: %v", instance.Name, err)
-				continue
-			}
-			req.Header.Set("X-Plex-Token", instance.PlexToken)
-			req.Header.Set("Accept", "application/json") // Request JSON, easier to parse initially
-
-			resp, err := httpClient.Do(req)
-			if err != nil {
-				log.Printf("Error fetching history from %s: %v", instance.Name, err)
-				continue
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				log.Printf("Error fetching history from %s: status code %d", instance.Name, resp.StatusCode)
-				continue
-			}
-
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				log.Printf("Error reading history response body from %s: %v", instance.Name, err)
-				continue
-			}
-
-			// Plex often returns XML, but we requested JSON. If it's XML, we'll need to adjust.
-			// For now, let's assume we can get JSON or adapt if Plex forces XML.
-			// The Plex API can be inconsistent with the 'Accept' header for this endpoint.
-			// We will try to unmarshal as PlexHistoryMediaContainer (which expects XML tags)
-			var historyContainer PlexHistoryMediaContainer // Single declaration
-			if err := xml.Unmarshal(body, &historyContainer); err == nil {
-				for _, item := range historyContainer.Videos {
-					item.SourceServerName = instance.Name
-					currentCycleHistory = append(currentCycleHistory, item)
+			go func(inst PlexInstanceConfig) {
+				result := historyResult{server: inst.Name}
+				
+				historyURL := fmt.Sprintf("%s/status/sessions/history/all", inst.URL)
+				req, err := http.NewRequestWithContext(ctx, "GET", historyURL, nil)
+				if err != nil {
+					result.err = fmt.Errorf("error creating request: %w", err)
+					resultChan <- result
+					return
 				}
-				log.Printf("Fetched %d history items (XML) from %s", len(historyContainer.Videos), instance.Name)
-			} else {
-				log.Printf("Failed to unmarshal history as XML from %s (will try JSON): %v", instance.Name, err)
-				var jsonHistoryContainer JSONPlexMediaContainer
-				if err := json.Unmarshal(body, &jsonHistoryContainer); err == nil {
-					log.Printf("Successfully unmarshalled history as JSON from %s. Items: %d", instance.Name, jsonHistoryContainer.MediaContainer.Size)
-					for _, jsonItem := range jsonHistoryContainer.MediaContainer.Metadata {
-						// Convert JSONPlexHistoryItem to PlexHistoryItem
-						historyItem := PlexHistoryItem{
-							Key:                   jsonItem.Key,
-							RatingKey:             jsonItem.RatingKey,
-							ParentRatingKey:       jsonItem.ParentRatingKey,
-							GrandparentRatingKey:  jsonItem.GrandparentRatingKey,
-							Title:                 jsonItem.Title,
-							GrandparentTitle:      jsonItem.GrandparentTitle,
-							ParentTitle:           jsonItem.ParentTitle,
-							Type:                  jsonItem.Type,
-							Thumb:                 jsonItem.Thumb,
-							Art:                   jsonItem.Art,
-							ParentThumb:           jsonItem.ParentThumb,
-							GrandparentThumb:      jsonItem.GrandparentThumb,
-							OriginallyAvailableAt: jsonItem.OriginallyAvailableAt,
-							ViewedAt:              jsonItem.ViewedAt,
-							AccountID:             jsonItem.AccountID,
-							DeviceID:              jsonItem.DeviceID,
-							SourceServerName:      instance.Name,
-						}
-						currentCycleHistory = append(currentCycleHistory, historyItem)
+				
+				req.Header.Set("X-Plex-Token", inst.PlexToken)
+				req.Header.Set("Accept", "application/json")
+				
+				resp, err := insecureHTTPClient.Do(req)
+				if err != nil {
+					result.err = fmt.Errorf("error fetching history: %w", err)
+					resultChan <- result
+					return
+				}
+				defer resp.Body.Close()
+				
+				if resp.StatusCode != http.StatusOK {
+					result.err = fmt.Errorf("status code %d", resp.StatusCode)
+					resultChan <- result
+					return
+				}
+				
+				// Use buffer pool
+				buf := bufferPool.Get().(*bytes.Buffer)
+				buf.Reset()
+				defer bufferPool.Put(buf)
+				
+				_, err = io.Copy(buf, resp.Body)
+				if err != nil {
+					result.err = fmt.Errorf("error reading response: %w", err)
+					resultChan <- result
+					return
+				}
+				
+				// Try XML first, then JSON
+				var historyContainer PlexHistoryMediaContainer
+				if err := xml.Unmarshal(buf.Bytes(), &historyContainer); err == nil {
+					for i := range historyContainer.Videos {
+						historyContainer.Videos[i].SourceServerName = inst.Name
 					}
-					log.Printf("Fetched %d history items (JSON converted) from %s", len(jsonHistoryContainer.MediaContainer.Metadata), instance.Name)
+					result.items = historyContainer.Videos
+					log.Printf("Fetched %d history items (XML) from %s", len(result.items), inst.Name)
 				} else {
-					// Log the body if both XML and JSON unmarshal fail for debugging
-					var bodySample string
-					if len(body) > 500 {
-						bodySample = string(body[:500])
+					// Try JSON
+					var jsonHistoryContainer JSONPlexMediaContainer
+					if err := json.Unmarshal(buf.Bytes(), &jsonHistoryContainer); err == nil {
+						result.items = make([]PlexHistoryItem, 0, len(jsonHistoryContainer.MediaContainer.Metadata))
+						for _, jsonItem := range jsonHistoryContainer.MediaContainer.Metadata {
+							historyItem := PlexHistoryItem{
+								Key:                   jsonItem.Key,
+								RatingKey:             jsonItem.RatingKey,
+								ParentRatingKey:       jsonItem.ParentRatingKey,
+								GrandparentRatingKey:  jsonItem.GrandparentRatingKey,
+								Title:                 jsonItem.Title,
+								GrandparentTitle:      jsonItem.GrandparentTitle,
+								ParentTitle:           jsonItem.ParentTitle,
+								Type:                  jsonItem.Type,
+								Thumb:                 jsonItem.Thumb,
+								Art:                   jsonItem.Art,
+								ParentThumb:           jsonItem.ParentThumb,
+								GrandparentThumb:      jsonItem.GrandparentThumb,
+								OriginallyAvailableAt: jsonItem.OriginallyAvailableAt,
+								ViewedAt:              jsonItem.ViewedAt,
+								AccountID:             jsonItem.AccountID,
+								DeviceID:              jsonItem.DeviceID,
+								SourceServerName:      inst.Name,
+							}
+							result.items = append(result.items, historyItem)
+						}
+						log.Printf("Fetched %d history items (JSON) from %s", len(result.items), inst.Name)
 					} else {
-						bodySample = string(body)
+						result.err = fmt.Errorf("failed to unmarshal as XML or JSON")
 					}
-					log.Printf("Error unmarshalling history from %s as XML and JSON. JSON error: %v. Body sample: %s", instance.Name, err, bodySample)
-					continue // Skip this instance if parsing fails for both
 				}
-			}
-
-			// This logging was inside the XML part, moved out or handled by new logic
-			// if xmlParsed {
-			// 	 log.Printf("Fetched %d history items from %s", len(historyContainer.Videos), instance.Name)
-			// }
+				
+				resultChan <- result
+			}(instance)
 		}
-
-
-
-
+		
+		// Collect all results
+		var allHistory []PlexHistoryItem
+		for i := 0; i < len(config.SourcePlexServers); i++ {
+			result := <-resultChan
+			if result.err != nil {
+				log.Printf("Error fetching history from %s: %v", result.server, result.err)
+				continue
+			}
+			allHistory = append(allHistory, result.items...)
+		}
+		
+		cancel() // Clean up context
+		
 		// Sort by ViewedAt descending (most recent first)
-		sort.SliceStable(currentCycleHistory, func(i, j int) bool {
-			return currentCycleHistory[i].ViewedAt > currentCycleHistory[j].ViewedAt
+		sort.SliceStable(allHistory, func(i, j int) bool {
+			return allHistory[i].ViewedAt > allHistory[j].ViewedAt
 		})
-
-		// Deduplicate (simple approach: keep first seen based on a unique key, e.g., RatingKey + ViewedAt + AccountID)
-		// More sophisticated deduplication might be needed if items can truly be identical across servers but mean different views.
-		seen := make(map[string]bool)
-		var uniqueHistory []PlexHistoryItem
-		for _, item := range currentCycleHistory {
-			// Using RatingKey and ViewedAt as a composite key for deduplication for now.
-			// AccountID might also be necessary if different users on different servers watch the same thing at the same time.
-			duplicateKey := fmt.Sprintf("%s-%d-%d", item.RatingKey, item.ViewedAt, item.AccountID)
-			if !seen[duplicateKey] {
-				seen[duplicateKey] = true
+		
+		// Efficient deduplication using map with composite key
+		seen := make(map[string]struct{})
+		uniqueHistory := make([]PlexHistoryItem, 0, len(allHistory))
+		
+		for _, item := range allHistory {
+			// Create a more comprehensive deduplication key
+			key := fmt.Sprintf("%s|%d|%d|%s", item.RatingKey, item.ViewedAt, item.AccountID, item.SourceServerName)
+			if _, exists := seen[key]; !exists {
+				seen[key] = struct{}{}
 				uniqueHistory = append(uniqueHistory, item)
 			}
 		}
-
+		
+		// Update global history with lock
 		mergedHistoryMutex.Lock()
 		mergedHistory = uniqueHistory
 		mergedHistoryMutex.Unlock()
-
-		log.Printf("History sync cycle complete. Total merged and unique items: %d", len(mergedHistory))
-
+		
+		log.Printf("History sync complete. Total items: %d, Unique items: %d", len(allHistory), len(uniqueHistory))
+		
+		// Check if we should continue syncing
 		if config.SyncIntervalMinutes <= 0 {
-			log.Println("SyncIntervalMinutes is not configured or is invalid. History sync will run once then stop.")
-			return // Exits the goroutine
+			log.Println("SyncIntervalMinutes not configured, history sync will run once")
+			return
 		}
+		
+		// Wait for next sync cycle
 		time.Sleep(time.Duration(config.SyncIntervalMinutes) * time.Minute)
 	}
+}
+
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !checkAuth(r, false) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
