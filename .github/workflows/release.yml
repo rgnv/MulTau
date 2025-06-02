@@ -69,7 +69,23 @@ jobs:
           draft: false
           prerelease: false
 
+      - name: Check for tar.gz assets
+        id: check_targz_assets
+        run: |
+          shopt -s nullglob
+          files=(./MulTau_*.tar.gz)
+          if [ ${#files[@]} -gt 0 ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "Found tar.gz files: ${files[*]}"
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "No tar.gz files found matching ./MulTau_*.tar.gz"
+          fi
+          shopt -u nullglob
+        shell: bash
+
       - name: Upload Release Assets (tar.gz)
+        if: steps.check_targz_assets.outputs.found == 'true'
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -78,7 +94,23 @@ jobs:
           asset_path: ./MulTau_*.tar.gz
           asset_content_type: application/gzip
 
+      - name: Check for zip assets
+        id: check_zip_assets
+        run: |
+          shopt -s nullglob
+          files=(./MulTau_*.zip)
+          if [ ${#files[@]} -gt 0 ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "Found zip files: ${files[*]}"
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "No zip files found matching ./MulTau_*.zip"
+          fi
+          shopt -u nullglob
+        shell: bash
+
       - name: Upload Release Assets (zip)
+        if: steps.check_zip_assets.outputs.found == 'true'
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
