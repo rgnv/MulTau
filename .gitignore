@@ -1,3 +1,10 @@
+# Compiled Go binaries
+MulTau
+MulTau.exe
+
+# Log files
+*.log
+
+# Local configuration (if you don't want to accidentally commit it)
 config.json
 .DS_Store
-MulTau
