@@ -84,6 +84,12 @@ jobs:
           shopt -u nullglob
         shell: bash
 
+      - name: List files before tar.gz upload
+        if: steps.check_targz_assets.outputs.found == 'true'
+        run: |
+          echo "Listing files in current directory:"
+          ls -l
+
       - name: Upload Release Assets (tar.gz)
         if: steps.check_targz_assets.outputs.found == 'true'
         uses: actions/upload-release-asset@v1
@@ -108,6 +114,12 @@ jobs:
           fi
           shopt -u nullglob
         shell: bash
+
+      - name: List files before zip upload
+        if: steps.check_zip_assets.outputs.found == 'true'
+        run: |
+          echo "Listing files in current directory:"
+          ls -l
 
       - name: Upload Release Assets (zip)
         if: steps.check_zip_assets.outputs.found == 'true'
