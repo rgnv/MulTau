@@ -87,18 +87,16 @@ jobs:
       - name: List files before tar.gz upload
         if: steps.check_targz_assets.outputs.found == 'true'
         run: |
-          echo "Listing files in current directory:"
-          ls -l
+          echo "Listing files in current directory (for tar.gz upload):"
+          ls -l MulTau_*.tar.gz
 
-      - name: Upload Release Assets (tar.gz)
+      - name: Upload Release Assets (tar.gz) using gh
         if: steps.check_targz_assets.outputs.found == 'true'
-        uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: MulTau_*.tar.gz
-          asset_content_type: application/gzip
+          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
+        run: |
+          gh release upload "$RELEASE_VERSION" MulTau_*.tar.gz --clobber
 
       - name: Check for zip assets
         id: check_zip_assets
@@ -118,15 +116,13 @@ jobs:
       - name: List files before zip upload
         if: steps.check_zip_assets.outputs.found == 'true'
         run: |
-          echo "Listing files in current directory:"
-          ls -l
+          echo "Listing files in current directory (for zip upload):"
+          ls -l MulTau_*.zip
 
-      - name: Upload Release Assets (zip)
+      - name: Upload Release Assets (zip) using gh
         if: steps.check_zip_assets.outputs.found == 'true'
-        uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: MulTau_*.zip
-          asset_content_type: application/zip
+          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
+        run: |
+          gh release upload "$RELEASE_VERSION" MulTau_*.zip --clobber
