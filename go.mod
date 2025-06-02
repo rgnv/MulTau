@@ -1,4 +1,4 @@
-module tautulli-aggregator
+module MulTau
 
 go 1.20
 
